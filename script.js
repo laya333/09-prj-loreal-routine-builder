@@ -845,6 +845,15 @@ function extractFromResponsesOutput(data) {
   };
 }
 
+/* Return a helpful user-facing error message without exposing technical details */
+function getFriendlyErrorMessage(error, fallbackMessage) {
+  if (error?.status === 429) {
+    return "You're sending messages too quickly. Please wait a moment and try again.";
+  }
+
+  return fallbackMessage;
+}
+
 /* Send the FULL messages array to the Cloudflare Worker and return reply + citations */
 async function sendConversationToWorker() {
   const response = await fetch(WORKER_URL, {
@@ -865,7 +874,9 @@ async function sendConversationToWorker() {
     } catch {
       // Ignore non-JSON error responses
     }
-    throw new Error(errorDetail);
+    const httpError = new Error(errorDetail);
+    httpError.status = response.status;
+    throw httpError;
   }
 
   const data = await response.json();
@@ -959,7 +970,10 @@ async function generatePersonalizedRoutine() {
     messages.pop();
     updateAssistantBubble(
       loadingBubble,
-      "Sorry, I couldn't connect to the routine advisor right now. Please check your internet connection or try again in a moment.",
+      getFriendlyErrorMessage(
+        error,
+        "Sorry, I couldn't connect to the routine advisor right now. Please check your internet connection or try again in a moment."
+      ),
       true
     );
   } finally {
@@ -1009,7 +1023,10 @@ async function handleFollowUpQuestion(questionText) {
     messages.pop();
     updateAssistantBubble(
       loadingBubble,
-      "Sorry, I couldn't reach the beauty advisor right now. Please try sending your question again.",
+      getFriendlyErrorMessage(
+        error,
+        "Sorry, I couldn't reach the beauty advisor right now. Please try sending your question again."
+      ),
       true
     );
   } finally {
