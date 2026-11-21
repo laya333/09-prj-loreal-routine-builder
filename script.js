@@ -71,7 +71,8 @@ ROUTINE & ADVICE GUIDELINES:
 3. Explain the exact step-by-step order (first, second, third, etc.), how and when to use each product, and separate Morning (AM) and Evening (PM) steps when appropriate.
 4. Share helpful application tips and note any important ingredient compatibility or layering concerns (such as spacing retinol with exfoliating acids or benzoyl peroxide, or pairing vitamin C with sunscreen).
 5. If the user's selected products are insufficient for a complete routine (for example, missing a cleanser, moisturizer, or sunscreen), explain that honestly without pretending unselected products are included.
-6. Avoid unsupported medical claims, and advise the user to consult a dermatologist or qualified healthcare professional for medical skin concerns.`;
+6. Avoid unsupported medical claims, and advise the user to consult a dermatologist or qualified healthcare professional for medical skin concerns.
+7. When the user asks about current L'Oréal product launches, recent formula updates, availability, or up-to-date beauty and ingredient information beyond the catalog, use live web search when helpful while keeping all answers focused on beauty and personal care.`;
 
 /* Application state:
    - allProducts caches the list loaded from products.json
@@ -643,22 +644,40 @@ function formatAssistantReply(replyText) {
   return htmlParts.join("");
 }
 
-/* Extract safe citation links if the Worker returns url_citation annotations */
-function renderCitationsHTML(annotations) {
-  if (!Array.isArray(annotations) || annotations.length === 0) {
+/* Extract safe citation links from Responses API citations or url_citation annotations */
+function renderCitationsHTML(citations) {
+  if (!Array.isArray(citations) || citations.length === 0) {
     return "";
   }
 
   const uniqueLinks = [];
-  annotations.forEach((note) => {
-    const url = note?.url_citation?.url || note?.url;
-    const title = note?.url_citation?.title || note?.title || url;
+  citations.forEach((note) => {
+    const rawUrl =
+      typeof note === "string"
+        ? note
+        : note?.url_citation?.url || note?.url;
+    const rawTitle =
+      typeof note === "string"
+        ? note
+        : note?.url_citation?.title || note?.title || rawUrl;
+
     if (
-      typeof url === "string" &&
-      (url.startsWith("https://") || url.startsWith("http://")) &&
-      !uniqueLinks.some((item) => item.url === url)
+      typeof rawUrl === "string" &&
+      (rawUrl.startsWith("https://") || rawUrl.startsWith("http://")) &&
+      !uniqueLinks.some((item) => item.url === rawUrl)
     ) {
-      uniqueLinks.push({ url, title });
+      let domain = "";
+      try {
+        domain = new URL(rawUrl).hostname.replace(/^www\./, "");
+      } catch {
+        domain = "";
+      }
+
+      uniqueLinks.push({
+        url: rawUrl,
+        title: String(rawTitle || rawUrl).trim(),
+        domain,
+      });
     }
   });
 
@@ -667,15 +686,28 @@ function renderCitationsHTML(annotations) {
   }
 
   const linksMarkup = uniqueLinks
-    .map(
-      (link) =>
-        `<li><a href="${escapeHTML(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(link.title)}</a></li>`
-    )
+    .map((link) => {
+      const domainBadge = link.domain
+        ? `<span class="chat-citation-domain">${escapeHTML(link.domain)}</span>`
+        : "";
+
+      return `
+        <li>
+          <a href="${escapeHTML(link.url)}" target="_blank" rel="noopener noreferrer">
+            <span class="chat-citation-title">${escapeHTML(link.title)}</span>
+            ${domainBadge}
+          </a>
+        </li>
+      `;
+    })
     .join("");
 
   return `
     <div class="chat-citations">
-      <div class="chat-citations-title">Sources</div>
+      <div class="chat-citations-title">
+        <i class="fa-solid fa-globe" aria-hidden="true"></i>
+        <span>Sources</span>
+      </div>
       <ul>${linksMarkup}</ul>
     </div>
   `;
@@ -779,7 +811,41 @@ function buildSelectedProductsSummary(products) {
     .join("\n\n");
 }
 
-/* Send the FULL messages array to the Cloudflare Worker and return reply + annotations */
+/* Extract reply text and url_citation links if raw Responses API JSON is returned */
+function extractFromResponsesOutput(data) {
+  const textParts = [];
+  const citations = [];
+
+  if (Array.isArray(data?.output)) {
+    data.output.forEach((item) => {
+      if (item?.type === "message" && Array.isArray(item.content)) {
+        item.content.forEach((part) => {
+          if (part?.type === "output_text" && typeof part.text === "string") {
+            textParts.push(part.text);
+            if (Array.isArray(part.annotations)) {
+              part.annotations.forEach((ann) => {
+                if (ann?.type === "url_citation") {
+                  citations.push(ann);
+                }
+              });
+            }
+          }
+        });
+      }
+    });
+  }
+
+  const fallbackText =
+    textParts.join("\n").trim() ||
+    (typeof data?.output_text === "string" ? data.output_text.trim() : "");
+
+  return {
+    reply: fallbackText,
+    citations,
+  };
+}
+
+/* Send the FULL messages array to the Cloudflare Worker and return reply + citations */
 async function sendConversationToWorker() {
   const response = await fetch(WORKER_URL, {
     method: "POST",
@@ -793,6 +859,8 @@ async function sendConversationToWorker() {
       const errorData = await response.json();
       if (errorData?.error?.message) {
         errorDetail = `${errorDetail}: ${errorData.error.message}`;
+      } else if (typeof errorData?.error === "string") {
+        errorDetail = `${errorDetail}: ${errorData.error}`;
       }
     } catch {
       // Ignore non-JSON error responses
@@ -805,16 +873,46 @@ async function sendConversationToWorker() {
   if (data?.error?.message) {
     throw new Error(data.error.message);
   }
-
-  const replyContent = data?.choices?.[0]?.message?.content;
-  if (typeof replyContent !== "string" || !replyContent.trim()) {
-    throw new Error("Invalid response format from the AI service.");
+  if (typeof data?.error === "string") {
+    throw new Error(data.error);
   }
 
-  return {
-    reply: replyContent,
-    annotations: data.choices[0].message.annotations || [],
-  };
+  // 1. Clean JSON format returned by the updated Responses API Worker:
+  //    { reply: "...", citations: [{ title, url }], usedWebSearch: true/false }
+  if (typeof data?.reply === "string" && data.reply.trim()) {
+    return {
+      reply: data.reply,
+      annotations: Array.isArray(data.citations)
+        ? data.citations
+        : Array.isArray(data.sources)
+        ? data.sources
+        : Array.isArray(data.annotations)
+        ? data.annotations
+        : [],
+    };
+  }
+
+  // 2. Raw OpenAI Responses API JSON format (if Worker forwards OpenAI response directly)
+  if (Array.isArray(data?.output) || typeof data?.output_text === "string") {
+    const parsed = extractFromResponsesOutput(data);
+    if (parsed.reply) {
+      return {
+        reply: parsed.reply,
+        annotations: parsed.citations,
+      };
+    }
+  }
+
+  // 3. Backwards-compatible OpenAI Chat Completions format
+  const replyContent = data?.choices?.[0]?.message?.content;
+  if (typeof replyContent === "string" && replyContent.trim()) {
+    return {
+      reply: replyContent,
+      annotations: data.choices[0].message.annotations || [],
+    };
+  }
+
+  throw new Error("Invalid response format from the AI service.");
 }
 
 /* Generate a personalized routine from the currently selected products */
